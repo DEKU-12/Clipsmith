@@ -1,0 +1,9 @@
+.env
+runs/
+*.mp4
+*.wav
+*.ass
+__pycache__/
+.venv/
+.idea/
+.claude/

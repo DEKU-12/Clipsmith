@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Clipsmith pipeline orchestrator.
+
+Usage:
+    python run_pipeline.py <youtube-url> [--clips 5] [--workdir runs/ep1]
+                            [--max-minutes N] [--dry-run]
+"""
+
+import argparse
+import json
+import os
+import subprocess
+
+VIDEO_CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920"
+SENTENCE_PAD = 0.3
+MIN_CLIP_LEN = 20
+MAX_CLIP_LEN = 75
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, **kwargs)
+
+
+def default_workdir(url: str) -> str:
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--get-id", url], check=True, capture_output=True, text=True
+        )
+        video_id = result.stdout.strip().splitlines()[-1]
+    except Exception:
+        video_id = "episode"
+    return os.path.join("runs", video_id)
+
+
+# --------------------------------------------------------------------------
+# Stage 1: ingest
+# --------------------------------------------------------------------------
+
+def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]:
+    video_path = os.path.join(workdir, "episode.mp4")
+    audio_path = os.path.join(workdir, "episode.wav")
+
+    if os.path.exists(video_path) and os.path.exists(audio_path):
+        log("[cache] episode.mp4 / episode.wav already exist, skipping download")
+        return video_path, audio_path
+
+    os.makedirs(workdir, exist_ok=True)
+    log(f"==> Downloading {url}")
+    raw_path = os.path.join(workdir, "episode_raw.mp4")
+    run(["yt-dlp", "-f", "mp4", "-o", raw_path, url])
+
+    if max_minutes:
+        log(f"==> Trimming to first {max_minutes} minutes")
+        run(["ffmpeg", "-y", "-i", raw_path, "-t", str(max_minutes * 60), "-c", "copy", video_path])
+        os.remove(raw_path)
+    else:
+        os.rename(raw_path, video_path)
+
+    log("==> Extracting audio (16kHz mono wav for transcription)")
+    run(["ffmpeg", "-y", "-i", video_path, "-ar", "16000", "-ac", "1", "-vn", audio_path])
+
+    return video_path, audio_path
+
+
+# --------------------------------------------------------------------------
+# Stage 2: transcribe
+# --------------------------------------------------------------------------
+
+def transcribe(audio_path: str, workdir: str) -> dict:
+    transcript_path = os.path.join(workdir, "transcript.json")
+    if os.path.exists(transcript_path):
+        log("[cache] transcript.json already exists, skipping transcription")
+        with open(transcript_path) as f:
+            return json.load(f)
+
+    from faster_whisper import WhisperModel
+
+    device, compute_type, model_size = "cpu", "int8", "medium"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device, compute_type, model_size = "cuda", "float16", "large-v3"
+    except ImportError:
+        pass
+
+    log(f"==> Transcribing audio (faster-whisper: {model_size}, device={device})")
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    segments, info = model.transcribe(audio_path, word_timestamps=True)
+
+    sentences, words = [], []
+    for seg in segments:
+        sentences.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+        for w in seg.words or []:
+            words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+        log(f"    [{seg.start:6.1f}s] {seg.text.strip()[:80]}")
+
+    transcript = {"duration": info.duration, "sentences": sentences, "words": words}
+    with open(transcript_path, "w") as f:
+        json.dump(transcript, f, indent=2)
+
+    return transcript
+
+
+# --------------------------------------------------------------------------
+# Stage 3: find moments (Claude pass 1 — real integration lands in M2)
+# --------------------------------------------------------------------------
+
+def find_moments(transcript: dict, dry_run: bool, workdir: str) -> list[dict]:
+    candidates_path = os.path.join(workdir, "candidates.json")
+    if os.path.exists(candidates_path):
+        log("[cache] candidates.json already exists, skipping moment-finding")
+        with open(candidates_path) as f:
+            return json.load(f)
+
+    if not dry_run:
+        raise NotImplementedError(
+            "Real Claude moment-finding lands in M2. Run with --dry-run for now."
+        )
+
+    log("==> Finding viral moments (--dry-run: using 3 fake candidates)")
+    duration = transcript["duration"]
+    fake_specs = [
+        (0.12, "A bold contrarian claim early in the episode"),
+        (0.45, "A concrete story with a specific tactical takeaway"),
+        (0.75, "A punchy, quotable closing thought"),
+    ]
+    candidates = []
+    for frac, summary in fake_specs:
+        start = max(0.0, frac * duration)
+        end = min(duration, start + 35.0)
+        if end - start >= MIN_CLIP_LEN:
+            candidates.append({"start": start, "end": end, "summary": summary})
+
+    with open(candidates_path, "w") as f:
+        json.dump(candidates, f, indent=2)
+
+    return candidates
+
+
+# --------------------------------------------------------------------------
+# Stage 4: score clips (Claude pass 2 — real integration lands in M2)
+# --------------------------------------------------------------------------
+
+FAKE_METADATA = [
+    {
+        "score": 9,
+        "title": "This one habit changed everything",
+        "hook_line": "Nobody tells you this until it's too late.",
+        "description": "A candid, contrarian take you won't hear anywhere else.",
+        "hashtags": ["#business", "#mindset", "#entrepreneur"],
+        "reason": "Strong contrarian hook, self-contained, specific claim.",
+    },
+    {
+        "score": 8,
+        "title": "The exact tactic that doubled our results",
+        "hook_line": "Here's exactly what we did, step by step.",
+        "description": "A concrete, replicable tactic pulled straight from the episode.",
+        "hashtags": ["#growth", "#tactics", "#smallbusiness"],
+        "reason": "Concrete and actionable, clear before/after framing.",
+    },
+    {
+        "score": 7,
+        "title": "The line that says it all",
+        "hook_line": "If you remember one thing, remember this.",
+        "description": "A punchy, quotable closer that works as a standalone thought.",
+        "hashtags": ["#quote", "#wisdom", "#motivation"],
+        "reason": "Quotable and short, but slightly weaker opening hook.",
+    },
+]
+
+
+def score_clips(candidates: list[dict], dry_run: bool, workdir: str) -> list[dict]:
+    scored_path = os.path.join(workdir, "scored_clips.json")
+    if os.path.exists(scored_path):
+        log("[cache] scored_clips.json already exists, skipping scoring")
+        with open(scored_path) as f:
+            return json.load(f)
+
+    if not dry_run:
+        raise NotImplementedError(
+            "Real Claude scoring lands in M2. Run with --dry-run for now."
+        )
+
+    log("==> Scoring clips (--dry-run: using fake scores)")
+    scored = []
+    for i, cand in enumerate(candidates):
+        meta = FAKE_METADATA[i % len(FAKE_METADATA)]
+        clip = {**cand, **meta}
+        scored.append(clip)
+        log(f'    [{i + 1}/{len(candidates)}] score={clip["score"]}  "{clip["title"]}"  — {clip["reason"]}')
+
+    scored.sort(key=lambda c: c["score"], reverse=True)
+
+    with open(scored_path, "w") as f:
+        json.dump(scored, f, indent=2)
+
+    return scored
+
+
+# --------------------------------------------------------------------------
+# Boundary snapping
+# --------------------------------------------------------------------------
+
+def snap_boundaries(clips: list[dict], transcript: dict) -> list[dict]:
+    sentences = transcript["sentences"]
+    duration = transcript["duration"]
+    starts = [s["start"] for s in sentences]
+    ends = [s["end"] for s in sentences]
+
+    snapped = []
+    for clip in clips:
+        start = (min(starts, key=lambda c: abs(c - clip["start"])) if starts else clip["start"]) - SENTENCE_PAD
+        end = (min(ends, key=lambda c: abs(c - clip["end"])) if ends else clip["end"]) + SENTENCE_PAD
+        start = max(0.0, start)
+        end = min(duration, end)
+        if end - start < MIN_CLIP_LEN:
+            end = min(duration, start + MIN_CLIP_LEN)
+        if end - start > MAX_CLIP_LEN:
+            end = start + MAX_CLIP_LEN
+        snapped.append({**clip, "start": round(start, 2), "end": round(end, 2)})
+
+    return snapped
+
+
+# --------------------------------------------------------------------------
+# Cut + crop, caption burn
+# --------------------------------------------------------------------------
+
+def cut_and_crop(video_path: str, clip: dict, out_path: str) -> str:
+    if os.path.exists(out_path):
+        log(f"[cache] {os.path.basename(out_path)} already cut, skipping")
+        return out_path
+
+    run([
+        "ffmpeg", "-y",
+        "-ss", str(clip["start"]),
+        "-i", video_path,
+        "-t", str(clip["end"] - clip["start"]),
+        "-vf", VIDEO_CROP_FILTER,
+        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+        "-c:a", "aac",
+        out_path,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return out_path
+
+
+def burn_captions(cropped_path: str, clip: dict, transcript: dict, out_path: str) -> str:
+    import captions as captions_mod
+
+    if os.path.exists(out_path):
+        log(f"[cache] {os.path.basename(out_path)} already captioned, skipping")
+        return out_path
+
+    clip_words = [
+        {"word": w["word"], "start": w["start"] - clip["start"], "end": w["end"] - clip["start"]}
+        for w in transcript["words"]
+        if clip["start"] <= w["start"] < clip["end"]
+    ]
+
+    ass_path = out_path.replace(".mp4", ".ass")
+    captions_mod.build_ass_file(clip_words, ass_path)
+
+    escaped_ass = ass_path.replace(":", "\\:")
+    run([
+        "ffmpeg", "-y", "-i", cropped_path,
+        "-vf", f"ass={escaped_ass}",
+        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+        "-c:a", "copy",
+        out_path,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Clipsmith: long-form episode -> short-form clips + newsletter")
+    parser.add_argument("url", help="YouTube URL of the source episode")
+    parser.add_argument("--clips", type=int, default=5, help="Number of clips to produce")
+    parser.add_argument("--workdir", default=None, help="Working directory for this episode (default: runs/<video-id>)")
+    parser.add_argument("--max-minutes", type=float, default=None, help="Trim input to first N minutes (cheap iteration)")
+    parser.add_argument("--dry-run", action="store_true", help="Skip Claude calls, use fake candidates")
+    args = parser.parse_args()
+
+    workdir = args.workdir or default_workdir(args.url)
+    outputs_dir = os.path.join(workdir, "outputs")
+    os.makedirs(outputs_dir, exist_ok=True)
+
+    log(f"Clipsmith — workdir: {workdir}")
+    log("=" * 60)
+
+    video_path, audio_path = ingest(args.url, workdir, args.max_minutes)
+    transcript = transcribe(audio_path, workdir)
+    candidates = find_moments(transcript, args.dry_run, workdir)
+    scored = score_clips(candidates, args.dry_run, workdir)
+
+    top_clips = scored[: args.clips]
+
+    log(f"==> Snapping {len(top_clips)} cut boundaries to sentence edges")
+    top_clips = snap_boundaries(top_clips, transcript)
+
+    log("==> Cutting, cropping, and captioning clips")
+    metadata = []
+    for i, clip in enumerate(top_clips, start=1):
+        name = f"short_{i:02d}"
+        cropped_path = os.path.join(outputs_dir, f"{name}_cropped.mp4")
+        final_path = os.path.join(outputs_dir, f"{name}.mp4")
+
+        log(f'    [{i}/{len(top_clips)}] {name}: {clip["start"]:.1f}s -> {clip["end"]:.1f}s  "{clip["title"]}"')
+        cut_and_crop(video_path, clip, cropped_path)
+        burn_captions(cropped_path, clip, transcript, final_path)
+
+        metadata.append({
+            "file": os.path.basename(final_path),
+            "score": clip["score"],
+            "start": clip["start"],
+            "end": clip["end"],
+            "title": clip["title"],
+            "hook_line": clip["hook_line"],
+            "description": clip["description"],
+            "hashtags": clip["hashtags"],
+            "reason": clip["reason"],
+        })
+
+    metadata_path = os.path.join(outputs_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    log("=" * 60)
+    log(f"Done. {len(metadata)} clips written to {outputs_dir}/")
+
+
+if __name__ == "__main__":
+    main()
