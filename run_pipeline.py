@@ -9,12 +9,16 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 
 VIDEO_CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920"
 SENTENCE_PAD = 0.3
 MIN_CLIP_LEN = 20
 MAX_CLIP_LEN = 75
+GROQ_MODEL = "llama-3.3-70b-versatile"
+CONTEXT_WINDOW = 15.0
+MAX_REFINEMENT = 10.0
 
 
 def log(msg: str) -> None:
@@ -34,6 +38,41 @@ def default_workdir(url: str) -> str:
     except Exception:
         video_id = "episode"
     return os.path.join("runs", video_id)
+
+
+def _extract_json(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _call_llm_json(client, system: str, user_prompt: str):
+    for attempt in range(2):
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        raw = response.choices[0].message.content
+        try:
+            return json.loads(_extract_json(raw))
+        except json.JSONDecodeError:
+            if attempt == 1:
+                raise
+            user_prompt = (
+                user_prompt
+                + "\n\nYour previous response was not valid JSON. Return"
+                " ONLY the JSON, no prose, no markdown fences."
+            )
+
+
+def _sentences_in_range(transcript: dict, start: float, end: float) -> str:
+    return " ".join(
+        s["text"] for s in transcript["sentences"] if s["end"] > start and s["start"] < end
+    )
 
 
 # --------------------------------------------------------------------------
@@ -106,34 +145,42 @@ def transcribe(audio_path: str, workdir: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Stage 3: find moments (Claude pass 1 — real integration lands in M2)
+# Stage 3: find moments (LLM pass 1)
 # --------------------------------------------------------------------------
 
-def find_moments(transcript: dict, dry_run: bool, workdir: str) -> list[dict]:
+def find_moments(transcript: dict, dry_run: bool, workdir: str, num_candidates: int = 15) -> list[dict]:
     candidates_path = os.path.join(workdir, "candidates.json")
     if os.path.exists(candidates_path):
         log("[cache] candidates.json already exists, skipping moment-finding")
         with open(candidates_path) as f:
             return json.load(f)
 
-    if not dry_run:
-        raise NotImplementedError(
-            "Real Claude moment-finding lands in M2. Run with --dry-run for now."
-        )
+    if dry_run:
+        log("==> Finding viral moments (--dry-run: using 3 fake candidates)")
+        duration = transcript["duration"]
+        fake_specs = [
+            (0.12, "A bold contrarian claim early in the episode"),
+            (0.45, "A concrete story with a specific tactical takeaway"),
+            (0.75, "A punchy, quotable closing thought"),
+        ]
+        candidates = []
+        for frac, summary in fake_specs:
+            start = max(0.0, frac * duration)
+            end = min(duration, start + 35.0)
+            if end - start >= MIN_CLIP_LEN:
+                candidates.append({"start": start, "end": end, "summary": summary})
+    else:
+        import prompts
+        from groq import Groq
 
-    log("==> Finding viral moments (--dry-run: using 3 fake candidates)")
-    duration = transcript["duration"]
-    fake_specs = [
-        (0.12, "A bold contrarian claim early in the episode"),
-        (0.45, "A concrete story with a specific tactical takeaway"),
-        (0.75, "A punchy, quotable closing thought"),
-    ]
-    candidates = []
-    for frac, summary in fake_specs:
-        start = max(0.0, frac * duration)
-        end = min(duration, start + 35.0)
-        if end - start >= MIN_CLIP_LEN:
-            candidates.append({"start": start, "end": end, "summary": summary})
+        log("==> Finding viral moments (Groq pass 1)")
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        transcript_text = "\n".join(
+            f"[{s['start']:.1f}s] {s['text']}" for s in transcript["sentences"]
+        )
+        prompt = prompts.build_find_moments_prompt(transcript_text, num_candidates)
+        candidates = _call_llm_json(client, prompts.FIND_MOMENTS_SYSTEM, prompt)
+        log(f"    Groq found {len(candidates)} candidate moments")
 
     with open(candidates_path, "w") as f:
         json.dump(candidates, f, indent=2)
@@ -142,7 +189,7 @@ def find_moments(transcript: dict, dry_run: bool, workdir: str) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# Stage 4: score clips (Claude pass 2 — real integration lands in M2)
+# Stage 4: score clips (LLM pass 2)
 # --------------------------------------------------------------------------
 
 FAKE_METADATA = [
@@ -173,25 +220,48 @@ FAKE_METADATA = [
 ]
 
 
-def score_clips(candidates: list[dict], dry_run: bool, workdir: str) -> list[dict]:
+def score_clips(candidates: list[dict], transcript: dict, dry_run: bool, workdir: str) -> list[dict]:
     scored_path = os.path.join(workdir, "scored_clips.json")
     if os.path.exists(scored_path):
         log("[cache] scored_clips.json already exists, skipping scoring")
         with open(scored_path) as f:
             return json.load(f)
 
-    if not dry_run:
-        raise NotImplementedError(
-            "Real Claude scoring lands in M2. Run with --dry-run for now."
-        )
-
-    log("==> Scoring clips (--dry-run: using fake scores)")
     scored = []
-    for i, cand in enumerate(candidates):
-        meta = FAKE_METADATA[i % len(FAKE_METADATA)]
-        clip = {**cand, **meta}
-        scored.append(clip)
-        log(f'    [{i + 1}/{len(candidates)}] score={clip["score"]}  "{clip["title"]}"  — {clip["reason"]}')
+
+    if dry_run:
+        log("==> Scoring clips (--dry-run: using fake scores)")
+        for i, cand in enumerate(candidates):
+            meta = FAKE_METADATA[i % len(FAKE_METADATA)]
+            clip = {**cand, **meta}
+            scored.append(clip)
+            log(f'    [{i + 1}/{len(candidates)}] score={clip["score"]}  "{clip["title"]}"  — {clip["reason"]}')
+    else:
+        import prompts
+        from groq import Groq
+
+        log("==> Scoring clips (Groq pass 2)")
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        duration = transcript["duration"]
+        for i, cand in enumerate(candidates):
+            start, end = cand["start"], cand["end"]
+            clip_text = _sentences_in_range(transcript, start, end)
+            context_before = _sentences_in_range(transcript, max(0.0, start - CONTEXT_WINDOW), start)
+            context_after = _sentences_in_range(transcript, end, min(duration, end + CONTEXT_WINDOW))
+            prompt = prompts.build_score_clip_prompt(start, end, clip_text, context_before, context_after)
+            result = _call_llm_json(client, prompts.SCORE_CLIP_SYSTEM, prompt)
+
+            # Guard against the LLM returning snippet-relative (not
+            # absolute) timestamps by discarding refinements that drift
+            # too far from the original candidate window.
+            if abs(result.get("start", start) - start) > MAX_REFINEMENT:
+                result["start"] = start
+            if abs(result.get("end", end) - end) > MAX_REFINEMENT:
+                result["end"] = end
+
+            clip = {**cand, **result}
+            scored.append(clip)
+            log(f'    [{i + 1}/{len(candidates)}] score={clip["score"]}  "{clip["title"]}"  — {clip["reason"]}')
 
     scored.sort(key=lambda c: c["score"], reverse=True)
 
@@ -287,7 +357,7 @@ def main():
     parser.add_argument("--clips", type=int, default=5, help="Number of clips to produce")
     parser.add_argument("--workdir", default=None, help="Working directory for this episode (default: runs/<video-id>)")
     parser.add_argument("--max-minutes", type=float, default=None, help="Trim input to first N minutes (cheap iteration)")
-    parser.add_argument("--dry-run", action="store_true", help="Skip Claude calls, use fake candidates")
+    parser.add_argument("--dry-run", action="store_true", help="Skip Groq calls, use fake candidates")
     args = parser.parse_args()
 
     workdir = args.workdir or default_workdir(args.url)
@@ -300,7 +370,7 @@ def main():
     video_path, audio_path = ingest(args.url, workdir, args.max_minutes)
     transcript = transcribe(audio_path, workdir)
     candidates = find_moments(transcript, args.dry_run, workdir)
-    scored = score_clips(candidates, args.dry_run, workdir)
+    scored = score_clips(candidates, transcript, args.dry_run, workdir)
 
     top_clips = scored[: args.clips]
 

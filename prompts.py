@@ -1,8 +1,8 @@
-"""Claude prompt templates for Clipsmith.
+"""LLM prompt templates for Clipsmith (used with the Groq API).
 
 Wired up in M2 — see run_pipeline.py's find_moments()/score_clips()/
-generate_newsletter(). All prompts instruct Claude to return pure JSON;
-callers strip ``` fences defensively before json.loads.
+generate_newsletter(). All prompts instruct the model to return pure
+JSON; callers strip ``` fences defensively before json.loads.
 """
 
 FIND_MOMENTS_SYSTEM = (
@@ -42,14 +42,19 @@ SCORE_CLIP_SYSTEM = (
 )
 
 
-def build_score_clip_prompt(clip_text: str, context_before: str, context_after: str) -> str:
+def build_score_clip_prompt(
+    candidate_start: float, candidate_end: float, clip_text: str, context_before: str, context_after: str
+) -> str:
     return f"""Candidate clip transcript (with ~15s of context on each side
 for judgment only — do not include the context in the clip itself):
+
+The candidate clip currently spans {candidate_start:.1f}s to {candidate_end:.1f}s,
+in absolute seconds measured from the start of the full episode.
 
 --- CONTEXT BEFORE ---
 {context_before}
 
---- CANDIDATE CLIP ---
+--- CANDIDATE CLIP ({candidate_start:.1f}s to {candidate_end:.1f}s) ---
 {clip_text}
 
 --- CONTEXT AFTER ---
@@ -59,13 +64,17 @@ Score this candidate 1-10 for short-form virality. Hook strength (does the
 first 5 seconds grab attention?) is the heaviest weighted factor. The clip
 must be fully self-contained with zero prior context required.
 
-You may refine the start/end times slightly (a few seconds) to tighten the
-hook or land a cleaner ending, but keep the clip between 20 and 75 seconds.
+You may refine the start/end times slightly (at most a few seconds each
+way) to tighten the hook or land a cleaner ending, but keep the clip
+between 20 and 75 seconds. Your refined start/end MUST stay in absolute
+episode seconds, close to the given {candidate_start:.1f}s-{candidate_end:.1f}s
+range — do NOT reset them to be relative to the clip snippet (e.g. do not
+return a start near 0 unless {candidate_start:.1f}s is actually near 0).
 
 Return ONLY a JSON object, no prose, no markdown fences:
 {{
-  "start": <float seconds>,
-  "end": <float seconds>,
+  "start": <float seconds, absolute episode time, near {candidate_start:.1f}>,
+  "end": <float seconds, absolute episode time, near {candidate_end:.1f}>,
   "score": <int 1-10>,
   "title": "<punchy title, max 60 chars>",
   "hook_line": "<the exact opening line/moment that hooks viewers>",
