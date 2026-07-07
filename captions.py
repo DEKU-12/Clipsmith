@@ -6,6 +6,7 @@ VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 FONT_SIZE = 90
 CHUNK_SIZE = 3
+MIN_CHUNK_DURATION = 0.6
 # Distance from the bottom edge, positions captions in the lower-middle third.
 MARGIN_V = 420
 
@@ -51,7 +52,7 @@ def build_ass_file(words: list[dict], output_path: str, chunk_size: int = CHUNK_
             continue
 
         chunk_start = max(chunk[0]["start"], prev_chunk_end)
-        chunk_end = max(chunk[-1]["end"], chunk_start + 0.1)
+        chunk_end = max(chunk[-1]["end"], chunk_start + MIN_CHUNK_DURATION)
 
         karaoke_text = ""
         for w in chunk:
