@@ -154,7 +154,7 @@ def llm_judge(metadata: list[dict], newsletter: str, transcript: dict) -> None:
             "Is every factual claim in the title and description supported "
             "by the source transcript? Style/tone is fine; invented facts are not."
         )
-        verdict = rp._call_llm_json(client, system, prompt)
+        verdict = rp._call_llm_json(client, system, prompt, temperature=0.0)
         check(
             bool(verdict.get("supported")),
             f'clip {i} title/description supported',
@@ -168,10 +168,13 @@ def llm_judge(metadata: list[dict], newsletter: str, transcript: dict) -> None:
         f"GENERATED NEWSLETTER:\n{newsletter}\n\n"
         "Does the newsletter contain any topics, facts, or numbers that "
         "are NOT present in the source transcript? Direct blockquotes have "
-        "already been verified verbatim separately — ignore them and judge "
-        "only the newsletter's own prose."
+        "already been verified verbatim separately — ignore them. Also "
+        "ignore calls-to-action, subscribe/watch prompts, links, subject "
+        "lines, and formatting boilerplate: those are intentional newsletter "
+        "structure, not factual claims. Judge only whether the prose "
+        "misrepresents or invents episode content."
     )
-    verdict = rp._call_llm_json(client, system, prompt)
+    verdict = rp._call_llm_json(client, system, prompt, temperature=0.0)
     check(
         bool(verdict.get("supported")),
         "newsletter claims supported",

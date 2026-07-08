@@ -49,7 +49,8 @@ def _extract_json(text: str) -> str:
     return text.strip()
 
 
-def _call_llm_json(client, system: str, user_prompt: str):
+def _call_llm_json(client, system: str, user_prompt: str, temperature: float | None = None):
+    kwargs = {} if temperature is None else {"temperature": temperature}
     for attempt in range(2):
         response = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -57,6 +58,7 @@ def _call_llm_json(client, system: str, user_prompt: str):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
+            **kwargs,
         )
         raw = response.choices[0].message.content
         try:
