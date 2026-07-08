@@ -113,7 +113,7 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
     os.makedirs(workdir, exist_ok=True)
     log(f"==> Downloading {url}")
     raw_path = os.path.join(workdir, "episode_raw.mp4")
-    run([
+    cmd = [
         "yt-dlp", "--no-playlist",
         # Best <=1080p video + audio, merged by ffmpeg — the pre-merged
         # "-f mp4" fallback alone is usually only 360p, which upscales
@@ -121,8 +121,13 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
         "-f", "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]",
         "--merge-output-format", "mp4",
         "-o", raw_path,
-        "--", url,
-    ])
+    ]
+    if max_minutes:
+        # Only fetch the first N minutes instead of downloading the whole
+        # episode and trimming afterwards.
+        log(f"    (only the first {max_minutes} minutes)")
+        cmd += ["--download-sections", f"*0-{max_minutes * 60}"]
+    run(cmd + ["--", url])
 
     if max_minutes:
         log(f"==> Trimming to first {max_minutes} minutes")
