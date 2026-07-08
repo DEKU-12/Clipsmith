@@ -93,6 +93,7 @@ python run_pipeline.py <youtube-url> [--clips 5] [--workdir runs/ep1] [--max-min
 - `--workdir DIR` — working directory for this episode (default `runs/<video-id>`)
 - `--max-minutes N` — trim to the first N minutes before transcription, for cheap/fast iteration
 - `--dry-run` — skip all LLM calls, use 3 hardcoded fake candidates so the cut/caption stages can be tested at zero cost
+- `--whisper-model NAME` — override the transcription model (e.g. `small` for ~3× faster test runs; default: `medium` on CPU, `large-v3` on CUDA)
 
 **Cheap iteration example** (no LLM calls, ~30s):
 ```bash

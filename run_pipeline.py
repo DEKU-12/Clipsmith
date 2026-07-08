@@ -114,7 +114,7 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
     log(f"==> Downloading {url}")
     raw_path = os.path.join(workdir, "episode_raw.mp4")
     cmd = [
-        "yt-dlp", "--no-playlist",
+        "yt-dlp", "--no-playlist", "-N", "4",
         # Best <=1080p video + audio, merged by ffmpeg — the pre-merged
         # "-f mp4" fallback alone is usually only 360p, which upscales
         # badly to 1080x1920.
@@ -127,7 +127,18 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
         # episode and trimming afterwards.
         log(f"    (only the first {max_minutes} minutes)")
         cmd += ["--download-sections", f"*0-{max_minutes * 60}"]
-    run(cmd + ["--", url])
+
+    # YouTube intermittently rejects the first request from a fresh
+    # session (bot detection); an immediate retry almost always works.
+    for attempt in (1, 2, 3):
+        try:
+            run(cmd + ["--", url])
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 3:
+                raise
+            log(f"    download attempt {attempt} failed, retrying...")
+            time.sleep(3)
 
     if max_minutes:
         log(f"==> Trimming to first {max_minutes} minutes")
@@ -146,7 +157,7 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
 # Stage 2: transcribe
 # --------------------------------------------------------------------------
 
-def transcribe(audio_path: str, workdir: str) -> dict:
+def transcribe(audio_path: str, workdir: str, model_override: str | None = None) -> dict:
     transcript_path = os.path.join(workdir, "transcript.json")
     if os.path.exists(transcript_path):
         log("[cache] transcript.json already exists, skipping transcription")
@@ -162,10 +173,14 @@ def transcribe(audio_path: str, workdir: str) -> dict:
             device, compute_type, model_size = "cuda", "float16", "large-v3"
     except ImportError:
         pass
+    if model_override:
+        model_size = model_override
 
     log(f"==> Transcribing audio (faster-whisper: {model_size}, device={device})")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    segments, info = model.transcribe(audio_path, word_timestamps=True)
+    # vad_filter skips non-speech (music, dead air) — faster, and stops
+    # Whisper hallucinating words over silence.
+    segments, info = model.transcribe(audio_path, word_timestamps=True, vad_filter=True)
     log(f"    Audio duration: {info.duration / 60:.1f} min — estimating ETA as we go")
 
     start_time = time.time()
@@ -382,12 +397,14 @@ def snap_boundaries(clips: list[dict], transcript: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# Cut + crop, caption burn
+# Render: cut + crop + caption burn in a single encode
 # --------------------------------------------------------------------------
 
-def cut_and_crop(video_path: str, clip: dict, out_path: str) -> str:
+def render_clip(video_path: str, clip: dict, transcript: dict, out_path: str) -> str:
+    import captions as captions_mod
+
     if os.path.exists(out_path):
-        log(f"[cache] {os.path.basename(out_path)} already cut, skipping")
+        log(f"[cache] {os.path.basename(out_path)} already rendered, skipping")
         return out_path
 
     crop_filter = VIDEO_CROP_FILTER
@@ -406,42 +423,25 @@ def cut_and_crop(video_path: str, clip: dict, out_path: str) -> str:
     else:
         log("        no face detected, using center crop")
 
-    run([
-        "ffmpeg", "-y",
-        "-ss", str(clip["start"]),
-        "-i", video_path,
-        "-t", str(clip["end"] - clip["start"]),
-        "-vf", crop_filter,
-        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-        "-c:a", "aac",
-        out_path,
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    return out_path
-
-
-def burn_captions(cropped_path: str, clip: dict, transcript: dict, out_path: str) -> str:
-    import captions as captions_mod
-
-    if os.path.exists(out_path):
-        log(f"[cache] {os.path.basename(out_path)} already captioned, skipping")
-        return out_path
-
+    # Word timestamps shifted to clip-relative time; with -ss before -i,
+    # the output timeline also starts at 0, so they line up.
     clip_words = [
         {"word": w["word"], "start": w["start"] - clip["start"], "end": w["end"] - clip["start"]}
         for w in transcript["words"]
         if clip["start"] <= w["start"] < clip["end"]
     ]
-
     ass_path = out_path.replace(".mp4", ".ass")
     captions_mod.build_ass_file(clip_words, ass_path)
-
     escaped_ass = ass_path.replace(":", "\\:")
+
     run([
-        "ffmpeg", "-y", "-i", cropped_path,
-        "-vf", f"ass={escaped_ass}",
-        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-        "-c:a", "copy",
+        "ffmpeg", "-y",
+        "-ss", str(clip["start"]),
+        "-i", video_path,
+        "-t", str(clip["end"] - clip["start"]),
+        "-vf", f"{crop_filter},ass={escaped_ass}",
+        "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+        "-c:a", "aac",
         out_path,
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -501,6 +501,8 @@ def main():
     parser.add_argument("--workdir", default=None, help="Working directory for this episode (default: runs/<video-id>)")
     parser.add_argument("--max-minutes", type=float, default=None, help="Trim input to first N minutes (cheap iteration)")
     parser.add_argument("--dry-run", action="store_true", help="Skip Groq calls, use fake candidates")
+    parser.add_argument("--whisper-model", default=None,
+                        help="Override transcription model (e.g. 'small' for faster test runs; default: medium on CPU, large-v3 on CUDA)")
     args = parser.parse_args()
 
     if not args.url.startswith(("http://", "https://")):
@@ -514,7 +516,7 @@ def main():
     log("=" * 60)
 
     video_path, audio_path = ingest(args.url, workdir, args.max_minutes)
-    transcript = transcribe(audio_path, workdir)
+    transcript = transcribe(audio_path, workdir, args.whisper_model)
     candidates = find_moments(transcript, args.dry_run, workdir)
     scored = score_clips(candidates, transcript, args.dry_run, workdir)
 
@@ -527,12 +529,10 @@ def main():
     metadata = []
     for i, clip in enumerate(top_clips, start=1):
         name = f"short_{i:02d}"
-        cropped_path = os.path.join(outputs_dir, f"{name}_cropped.mp4")
         final_path = os.path.join(outputs_dir, f"{name}.mp4")
 
         log(f'    [{i}/{len(top_clips)}] {name}: {clip["start"]:.1f}s -> {clip["end"]:.1f}s  "{clip["title"]}"')
-        cut_and_crop(video_path, clip, cropped_path)
-        burn_captions(cropped_path, clip, transcript, final_path)
+        render_clip(video_path, clip, transcript, final_path)
 
         metadata.append({
             "file": os.path.basename(final_path),
