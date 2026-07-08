@@ -34,6 +34,8 @@ per-clip scoring printout is the demo centerpiece).
 - Cheap end-to-end test (no LLM calls, no API key needed):
   `python run_pipeline.py <url> --dry-run --max-minutes 3 --clips 2`
 - Real run: `python run_pipeline.py <url> --max-minutes 18 --clips 5`
+- Hallucination/spec audit of a finished REAL run:
+  `python eval.py runs/<name>` (dry-run outputs are fake and will fail it)
 - CI (GitHub Actions) runs the dry-run against a synthetic ffmpeg-generated
   video — YouTube blocks downloads from CI runner IPs, so never make the
   workflow fetch a real video.

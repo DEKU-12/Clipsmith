@@ -117,6 +117,27 @@ under the hood, so the CLI stays the source of truth.
 streamlit run app.py
 ```
 
+## Evaluating a run (hallucination checks)
+
+`eval.py` audits a finished run and exits non-zero on any failure:
+
+```bash
+python eval.py runs/<name> [--no-llm]
+```
+
+- **Deterministic layer** (free): every clip is 20-75s, inside the episode,
+  with complete metadata and a real file; no two clips cover the same
+  moment; each clip's `hook_line` fuzzy-matches the transcript at its
+  timestamps; every newsletter blockquote appears verbatim in the transcript.
+- **LLM-as-judge layer** (Groq, skip with `--no-llm`): checks that clip
+  titles/descriptions and the newsletter's prose don't claim anything the
+  episode never said.
+
+This caught a real bug during development: clip dedup originally ran
+before sentence-boundary snapping, so snapping could pull two "distinct"
+clips into near-total overlap. The eval flagged the 16s overlap; selection
+now happens after snapping.
+
 ## Sample console output
 
 ```

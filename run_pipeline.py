@@ -520,10 +520,12 @@ def main():
     candidates = find_moments(transcript, args.dry_run, workdir)
     scored = score_clips(candidates, transcript, args.dry_run, workdir)
 
-    top_clips = select_top_clips(scored, args.clips)
-
-    log(f"==> Snapping {len(top_clips)} cut boundaries to sentence edges")
-    top_clips = snap_boundaries(top_clips, transcript)
+    # Snap all candidates before choosing the top N: snapping can move
+    # boundaries enough to turn near-misses into duplicates, so dedup
+    # must see the final timestamps.
+    log("==> Snapping cut boundaries to sentence edges")
+    snapped = snap_boundaries(scored, transcript)
+    top_clips = select_top_clips(snapped, args.clips)
 
     log("==> Cutting, cropping, and captioning clips")
     metadata = []
