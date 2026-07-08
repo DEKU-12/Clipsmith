@@ -33,10 +33,18 @@ jobs:
           path: ~/.cache/huggingface
           key: faster-whisper-medium
 
-      - name: Run pipeline in --dry-run mode (no API key, no cost)
+      - name: Generate synthetic test video (avoids YouTube bot-detection in CI)
+        run: |
+          mkdir -p runs/ci_test
+          ffmpeg -y -f lavfi -i "testsrc=duration=90:size=640x480:rate=15" \
+                 -f lavfi -i "sine=frequency=440:duration=90" \
+                 -shortest -c:v libx264 -c:a aac runs/ci_test/episode.mp4
+          ffmpeg -y -i runs/ci_test/episode.mp4 -ar 16000 -ac 1 -vn runs/ci_test/episode.wav
+
+      - name: Run pipeline in --dry-run mode (no API key, no cost, no network video fetch)
         run: >
-          python run_pipeline.py "https://www.youtube.com/watch?v=UF8uR6Z6KLc"
-          --dry-run --max-minutes 2 --clips 1 --workdir runs/ci_test
+          python run_pipeline.py "https://youtube.com/watch?v=ci-synthetic-test"
+          --dry-run --clips 1 --workdir runs/ci_test
 
       - name: Verify outputs were produced
         run: |
