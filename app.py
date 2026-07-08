@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 import streamlit as st
 
@@ -33,25 +32,30 @@ if submitted:
         st.error("Please paste a YouTube URL.")
         st.stop()
 
-    workdir = f"runs/ui_{int(time.time())}"
-    cmd = [sys.executable, "run_pipeline.py", url.strip(), "--clips", str(int(clips)), "--workdir", workdir]
+    # No --workdir: let the pipeline derive runs/<video-id> so repeat
+    # runs of the same video reuse the download/transcription cache.
+    cmd = [sys.executable, "run_pipeline.py", url.strip(), "--clips", str(int(clips))]
     if max_minutes > 0:
         cmd += ["--max-minutes", str(max_minutes)]
     if dry_run:
         cmd.append("--dry-run")
 
     log_lines = []
+    workdir = None
     with st.status("Running pipeline...", expanded=True) as status:
         log_box = st.empty()
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
         for line in process.stdout:
-            log_lines.append(line.rstrip())
+            stripped = line.rstrip()
+            if workdir is None and stripped.startswith("Clipsmith — workdir:"):
+                workdir = stripped.split("workdir:", 1)[1].strip()
+            log_lines.append(stripped)
             log_box.code("\n".join(log_lines[-40:]))
         process.wait()
 
-        if process.returncode != 0:
+        if process.returncode != 0 or workdir is None:
             status.update(label="Pipeline failed", state="error")
             st.error("Pipeline failed. See log above for details.")
             st.stop()

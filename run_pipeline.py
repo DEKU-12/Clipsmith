@@ -33,7 +33,8 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 def default_workdir(url: str) -> str:
     try:
         result = subprocess.run(
-            ["yt-dlp", "--get-id", url], check=True, capture_output=True, text=True
+            ["yt-dlp", "--no-playlist", "--get-id", "--", url],
+            check=True, capture_output=True, text=True,
         )
         video_id = result.stdout.strip().splitlines()[-1]
     except Exception:
@@ -76,6 +77,27 @@ def _sentences_in_range(transcript: dict, start: float, end: float) -> str:
     )
 
 
+def _validate_candidates(raw, duration: float) -> list[dict]:
+    """Coerce pass-1 output into clean {start, end, summary} dicts,
+    dropping anything malformed so one bad element can't crash pass 2."""
+    if not isinstance(raw, list):
+        raise ValueError(f"expected a JSON array of candidates, got {type(raw).__name__}")
+    valid = []
+    for c in raw:
+        try:
+            start, end = float(c["start"]), float(c["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (0 <= start < end <= duration + 1):
+            continue
+        valid.append({"start": start, "end": end, "summary": str(c.get("summary", ""))})
+    if not valid:
+        raise ValueError("no usable candidates in pass-1 response")
+    if len(valid) < len(raw):
+        log(f"    dropped {len(raw) - len(valid)} malformed candidate(s)")
+    return valid
+
+
 # --------------------------------------------------------------------------
 # Stage 1: ingest
 # --------------------------------------------------------------------------
@@ -91,7 +113,16 @@ def ingest(url: str, workdir: str, max_minutes: float | None) -> tuple[str, str]
     os.makedirs(workdir, exist_ok=True)
     log(f"==> Downloading {url}")
     raw_path = os.path.join(workdir, "episode_raw.mp4")
-    run(["yt-dlp", "-f", "mp4", "-o", raw_path, url])
+    run([
+        "yt-dlp", "--no-playlist",
+        # Best <=1080p video + audio, merged by ffmpeg — the pre-merged
+        # "-f mp4" fallback alone is usually only 360p, which upscales
+        # badly to 1080x1920.
+        "-f", "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]",
+        "--merge-output-format", "mp4",
+        "-o", raw_path,
+        "--", url,
+    ])
 
     if max_minutes:
         log(f"==> Trimming to first {max_minutes} minutes")
@@ -191,7 +222,10 @@ def find_moments(transcript: dict, dry_run: bool, workdir: str, num_candidates: 
             f"[{s['start']:.1f}s] {s['text']}" for s in transcript["sentences"]
         )
         prompt = prompts.build_find_moments_prompt(transcript_text, num_candidates)
-        candidates = _call_llm_json(client, prompts.FIND_MOMENTS_SYSTEM, prompt)
+        candidates = _validate_candidates(
+            _call_llm_json(client, prompts.FIND_MOMENTS_SYSTEM, prompt),
+            transcript["duration"],
+        )
         log(f"    Groq found {len(candidates)} candidate moments")
 
     with open(candidates_path, "w") as f:
@@ -271,6 +305,18 @@ def score_clips(candidates: list[dict], transcript: dict, dry_run: bool, workdir
             if abs(result.get("end", end) - end) > MAX_REFINEMENT:
                 result["end"] = end
 
+            # Defaults for any field pass 2 forgot, so metadata assembly
+            # at the end of the run can't KeyError.
+            try:
+                result["score"] = int(result.get("score", 5))
+            except (TypeError, ValueError):
+                result["score"] = 5
+            result.setdefault("title", cand.get("summary", "Untitled clip")[:60])
+            result.setdefault("hook_line", "")
+            result.setdefault("description", cand.get("summary", ""))
+            result.setdefault("hashtags", [])
+            result.setdefault("reason", "")
+
             clip = {**cand, **result}
             scored.append(clip)
             log(f'    [{i + 1}/{len(candidates)}] score={clip["score"]}  "{clip["title"]}"  — {clip["reason"]}')
@@ -281,6 +327,28 @@ def score_clips(candidates: list[dict], transcript: dict, dry_run: bool, workdir
         json.dump(scored, f, indent=2)
 
     return scored
+
+
+def select_top_clips(scored: list[dict], n: int) -> list[dict]:
+    """Take the highest-scored clips, skipping any that substantially
+    overlap an already-selected one so the final set covers N distinct
+    moments (pass 1 sometimes proposes near-duplicate windows)."""
+    selected = []
+    for cand in scored:
+        if len(selected) >= n:
+            break
+        dup = False
+        for s in selected:
+            overlap = min(cand["end"], s["end"]) - max(cand["start"], s["start"])
+            shorter = min(cand["end"] - cand["start"], s["end"] - s["start"])
+            if shorter > 0 and overlap > 0.5 * shorter:
+                dup = True
+                break
+        if dup:
+            log(f'    [skip] "{cand.get("title", "?")}" overlaps an already-selected clip')
+        else:
+            selected.append(cand)
+    return selected
 
 
 # --------------------------------------------------------------------------
@@ -430,6 +498,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Skip Groq calls, use fake candidates")
     args = parser.parse_args()
 
+    if not args.url.startswith(("http://", "https://")):
+        parser.error("url must start with http:// or https://")
+
     workdir = args.workdir or default_workdir(args.url)
     outputs_dir = os.path.join(workdir, "outputs")
     os.makedirs(outputs_dir, exist_ok=True)
@@ -442,7 +513,7 @@ def main():
     candidates = find_moments(transcript, args.dry_run, workdir)
     scored = score_clips(candidates, transcript, args.dry_run, workdir)
 
-    top_clips = scored[: args.clips]
+    top_clips = select_top_clips(scored, args.clips)
 
     log(f"==> Snapping {len(top_clips)} cut boundaries to sentence edges")
     top_clips = snap_boundaries(top_clips, transcript)
