@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 VIDEO_CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920"
 SENTENCE_PAD = 0.3
@@ -129,13 +130,24 @@ def transcribe(audio_path: str, workdir: str) -> dict:
     log(f"==> Transcribing audio (faster-whisper: {model_size}, device={device})")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
     segments, info = model.transcribe(audio_path, word_timestamps=True)
+    log(f"    Audio duration: {info.duration / 60:.1f} min — estimating ETA as we go")
 
+    start_time = time.time()
     sentences, words = [], []
     for seg in segments:
         sentences.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
         for w in seg.words or []:
             words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
-        log(f"    [{seg.start:6.1f}s] {seg.text.strip()[:80]}")
+
+        elapsed = time.time() - start_time
+        progress = seg.end / info.duration if info.duration else 0
+        eta_str = ""
+        if 0 < progress < 1:
+            eta_min = (elapsed / progress - elapsed) / 60
+            eta_str = f"  (ETA {eta_min:.1f}min)"
+        log(f"    [{seg.start:6.1f}s]{eta_str} {seg.text.strip()[:70]}")
+
+    log(f"    Transcription finished in {(time.time() - start_time) / 60:.1f} min")
 
     transcript = {"duration": info.duration, "sentences": sentences, "words": words}
     with open(transcript_path, "w") as f:
@@ -348,6 +360,48 @@ def burn_captions(cropped_path: str, clip: dict, transcript: dict, out_path: str
 
 
 # --------------------------------------------------------------------------
+# Stage 5: newsletter (LLM pass 3)
+# --------------------------------------------------------------------------
+
+def generate_newsletter(transcript: dict, dry_run: bool, outputs_dir: str) -> str:
+    newsletter_path = os.path.join(outputs_dir, "newsletter.md")
+    if os.path.exists(newsletter_path):
+        log("[cache] newsletter.md already exists, skipping newsletter generation")
+        return newsletter_path
+
+    if dry_run:
+        log("==> Generating newsletter (--dry-run: using placeholder)")
+        content = (
+            "# [DRY RUN] Placeholder Subject Line\n\n"
+            "This is a placeholder newsletter generated in --dry-run mode.\n"
+        )
+    else:
+        import prompts
+        from groq import Groq
+
+        log("==> Generating newsletter (Groq pass 3)")
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        full_text = "\n".join(
+            f"[{s['start']:.1f}s] {s['text']}" for s in transcript["sentences"]
+        )
+        prompt = prompts.build_newsletter_prompt(full_text)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": prompts.NEWSLETTER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response.choices[0].message.content.strip()
+
+    with open(newsletter_path, "w") as f:
+        f.write(content)
+
+    log(f"    Newsletter written to {newsletter_path}")
+    return newsletter_path
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -403,6 +457,8 @@ def main():
     metadata_path = os.path.join(outputs_dir, "metadata.json")
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
+
+    generate_newsletter(transcript, args.dry_run, outputs_dir)
 
     log("=" * 60)
     log(f"Done. {len(metadata)} clips written to {outputs_dir}/")
