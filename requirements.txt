@@ -2,3 +2,4 @@ groq
 faster-whisper
 yt-dlp
 streamlit
+opencv-python-headless

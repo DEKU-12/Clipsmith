@@ -317,12 +317,28 @@ def cut_and_crop(video_path: str, clip: dict, out_path: str) -> str:
         log(f"[cache] {os.path.basename(out_path)} already cut, skipping")
         return out_path
 
+    crop_filter = VIDEO_CROP_FILTER
+    try:
+        import facecrop
+
+        face = facecrop.compute_crop_x(video_path, clip["start"], clip["end"])
+    except Exception as e:
+        log(f"        face detection unavailable ({e}), using center crop")
+        face = None
+
+    if face:
+        crop_x, crop_w, src_h = face
+        crop_filter = f"crop={crop_w}:{src_h}:{crop_x}:0,scale=1080:1920"
+        log(f"        face-aware crop: window x={crop_x} (of {crop_w}px wide)")
+    else:
+        log("        no face detected, using center crop")
+
     run([
         "ffmpeg", "-y",
         "-ss", str(clip["start"]),
         "-i", video_path,
         "-t", str(clip["end"] - clip["start"]),
-        "-vf", VIDEO_CROP_FILTER,
+        "-vf", crop_filter,
         "-c:v", "libx264", "-crf", "20", "-preset", "medium",
         "-c:a", "aac",
         out_path,

@@ -164,6 +164,13 @@ Done. 5 clips written to runs/yHW_seFM3nA/outputs/
 
 ## Notes
 
+- **The 9:16 crop is face-aware.** Each clip samples a handful of frames,
+  runs OpenCV's YuNet face detector (`facecrop.py`, model vendored in the
+  repo), and slides the crop window to center on the dominant face instead
+  of blindly cropping the frame middle — so side-by-side podcast layouts
+  crop to a person, not the wall between them. Falls back to a center crop
+  when no face is found. True active-speaker tracking (following whoever
+  is talking) is a known next step.
 - `runs/` is gitignored — no media files, transcripts, or generated
   output are tracked in version control.
 - Every stage caches to disk under `runs/<name>/`; re-running the same
