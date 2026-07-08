@@ -1,0 +1,45 @@
+name: Smoke test (dry-run)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install ffmpeg (Ubuntu's build includes libass)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Verify ffmpeg has the ass filter
+        run: ffmpeg -filters | grep -q " ass " || (echo "libass missing from ffmpeg build" && exit 1)
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache faster-whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: faster-whisper-medium
+
+      - name: Run pipeline in --dry-run mode (no API key, no cost)
+        run: >
+          python run_pipeline.py "https://www.youtube.com/watch?v=UF8uR6Z6KLc"
+          --dry-run --max-minutes 2 --clips 1 --workdir runs/ci_test
+
+      - name: Verify outputs were produced
+        run: |
+          test -f runs/ci_test/outputs/short_01.mp4 || (echo "Missing short_01.mp4" && exit 1)
+          test -f runs/ci_test/outputs/metadata.json || (echo "Missing metadata.json" && exit 1)
+          echo "Smoke test passed."
