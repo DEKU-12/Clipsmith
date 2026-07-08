@@ -1,3 +1,4 @@
 groq
 faster-whisper
 yt-dlp
+streamlit

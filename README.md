@@ -104,6 +104,18 @@ python run_pipeline.py "https://youtube.com/watch?v=..." --dry-run --max-minutes
 python run_pipeline.py "https://youtube.com/watch?v=..." --clips 5
 ```
 
+## Optional: browser UI
+
+`app.py` is a small Streamlit front-end over the same pipeline — paste a
+URL, set options, watch the console log stream live, then browse the
+resulting clips (with video players), metadata, and newsletter draft in
+the browser instead of the terminal. It shells out to `run_pipeline.py`
+under the hood, so the CLI stays the source of truth.
+
+```bash
+streamlit run app.py
+```
+
 ## Sample console output
 
 ```
